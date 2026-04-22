@@ -1,0 +1,27 @@
+# ── Google APIs ───────────────────────────────────────────────────────────────
+google-analytics-data>=0.18.14       # GA4 Data API (Python 3.13 compatible)
+google-api-python-client>=2.127.0    # Search Console + other Google APIs
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+google-ads>=29.0.0                   # Google Ads API (24.x requires Python <3.12)
+
+# ── BigCommerce ───────────────────────────────────────────────────────────────
+requests>=2.31.0                     # BigCommerce REST API (no SDK needed)
+
+# ── Database ──────────────────────────────────────────────────────────────────
+supabase>=2.4.2                      # Supabase Python client
+psycopg2-binary>=2.9.9               # Direct Postgres connection for bulk inserts
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+openai>=1.30.0                       # OpenAI Responses API for report narrative generation
+tenacity>=8.2.0                      # Retry with exponential backoff for API calls
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+pandas>=2.2.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.1                 # Load .env credentials
+schedule>=1.2.1                      # Lightweight weekly job scheduler
