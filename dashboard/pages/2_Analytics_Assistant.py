@@ -373,7 +373,7 @@ st.session_state["ga4_query"] = query
 
 button_col, status_col = st.columns([2, 5])
 with button_col:
-    run_clicked = st.button("Run Analysis", type="primary", disabled=not query.strip())
+    run_clicked = st.button("Run Analysis", type="primary")
 with status_col:
     st.caption("Sends your question to GA4 via the Data API, then interprets results with AI.")
 
@@ -397,7 +397,9 @@ def render_raw_query_details(reports: list[dict]) -> None:
                 st.caption("No rows returned for this report.")
 
 
-if run_clicked and query.strip():
+if run_clicked and not query.strip():
+    st.warning("Please enter a question first.")
+elif run_clicked and query.strip():
     with st.spinner("Querying GA4 and analyzing... this usually takes 15-30 seconds."):
         try:
             result_text, raw_results = run_ga4_query(query.strip())
