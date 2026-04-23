@@ -17,13 +17,12 @@ if _sa_info and not os.path.exists(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", ""))
 st.set_page_config(page_title="LBS Intelligence", page_icon="💡", layout="wide")
 
 st.title("Light Bulb Surplus Intelligence")
-st.info("To view this app: copy the URL from the terminal and paste it into Chrome.")
 st.markdown(
     """
 **AI-powered ecommerce analytics for Light Bulb Surplus.**
 
 Use the sidebar to navigate:
-- **Weekly Report** - Latest executive briefing and historical reports
-- **Query GA4** - Coming next in the next dashboard spec
+- **Weekly Report** — Latest executive briefing and historical reports
+- **Analytics Assistant** — Ask GA4 questions in plain English
 """
 )
