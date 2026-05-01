@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -10,6 +11,24 @@ from google.oauth2 import service_account
 from openai import OpenAI
 
 load_dotenv()
+
+# Bridge st.secrets → os.environ for direct navigation to this page on
+# Streamlit Cloud (Home.py may not have run in this session). Mirror of
+# the bootstrap in dashboard/Home.py — idempotent.
+try:
+    _secrets_items = list(st.secrets.items())
+except Exception:
+    _secrets_items = []
+for _k, _v in _secrets_items:
+    if isinstance(_v, str) and _k not in os.environ:
+        os.environ[_k] = _v
+
+_sa_info = os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
+if _sa_info and not os.path.exists(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")):
+    _sa_path = os.path.join(tempfile.gettempdir(), "google_service_account.json")
+    with open(_sa_path, "w", encoding="utf-8") as _f:
+        _f.write(_sa_info)
+    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = _sa_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GA4_MODEL = os.getenv("GA4_MODEL", "gpt-5.4-mini")

@@ -3,10 +3,19 @@ import tempfile
 
 import streamlit as st
 
-# On Streamlit Cloud the credentials file isn't in the repo (gitignored).
-# If GOOGLE_SERVICE_ACCOUNT_INFO is provided as a secret, materialize it to
-# disk and point GOOGLE_SERVICE_ACCOUNT_JSON at that path so existing
-# from_service_account_file() calls work unchanged.
+# Bridge st.secrets → os.environ. On Streamlit Cloud secrets live in
+# st.secrets only; the codebase reads config via os.getenv() everywhere.
+# Locally, load_dotenv() in each module already handles .env.
+try:
+    _secrets_items = list(st.secrets.items())
+except Exception:
+    _secrets_items = []
+for _k, _v in _secrets_items:
+    if isinstance(_v, str) and _k not in os.environ:
+        os.environ[_k] = _v
+
+# Materialize the service account JSON contents to a file so existing
+# from_service_account_file() calls work unchanged on Cloud.
 _sa_info = os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
 if _sa_info and not os.path.exists(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")):
     _sa_path = os.path.join(tempfile.gettempdir(), "google_service_account.json")
