@@ -10,6 +10,7 @@ tmp/
 
 # Project memory & handoff notes (keep local while repo is public)
 PROJECT_BRAIN.md
+LBS_INTELLIGENCE_PRD.md
 specs/
 
 # Research, analysis, and internal strategy docs (never commit)
