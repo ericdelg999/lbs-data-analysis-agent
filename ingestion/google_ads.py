@@ -12,7 +12,9 @@ Run schedule: weekly (Monday morning), pulls last 7 days at daily grain.
 
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
+import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from google.ads.googleads.client import GoogleAdsClient
@@ -79,11 +81,19 @@ def ingest_campaign_performance(client, db_conn, start_date: str, end_date: str)
     """
     Pull campaign + ad group performance by day and upsert into raw_gads_daily.
 
+    Two queries are merged:
+    - FROM ad_group: Standard/Shopping/Search campaigns (have normal ad groups)
+    - FROM campaign WHERE advertising_channel_type = PERFORMANCE_MAX: PMax campaigns
+      (no ad groups — uses 'PMAX' / 'Performance Max' as sentinel values so the
+      unique constraint on (date, campaign_id, ad_group_id) stays clean)
+
     Returns: number of rows written
     """
     share_lookup = _fetch_campaign_share_metrics(client, start_date, end_date)
+    ga_service = client.get_service("GoogleAdsService")
 
-    query = f"""
+    # --- Query 1: Standard ad-group-based campaigns ---
+    ad_group_query = f"""
         SELECT
             segments.date,
             campaign.id,
@@ -99,10 +109,8 @@ def ingest_campaign_performance(client, db_conn, start_date: str, end_date: str)
         WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
     """
 
-    ga_service = client.get_service("GoogleAdsService")
-    stream = ga_service.search_stream(customer_id=CUSTOMER_ID, query=query)
-
-    rows = []
+    non_pmax_rows = []
+    stream = ga_service.search_stream(customer_id=CUSTOMER_ID, query=ad_group_query)
     for batch in stream:
         for row in batch.results:
             date_val = datetime.strptime(str(row.segments.date), "%Y-%m-%d").date()
@@ -110,8 +118,7 @@ def ingest_campaign_performance(client, db_conn, start_date: str, end_date: str)
             search_impression_share, search_lost_is_rank, search_lost_is_budget = (
                 share_lookup.get((date_val, campaign_id), (None, None, None))
             )
-
-            rows.append((
+            non_pmax_rows.append((
                 date_val,
                 campaign_id,
                 row.campaign.name,
@@ -126,6 +133,54 @@ def ingest_campaign_performance(client, db_conn, start_date: str, end_date: str)
                 search_lost_is_rank,
                 search_lost_is_budget,
             ))
+
+    if not non_pmax_rows:
+        print("  [google_ads] WARNING: FROM ad_group returned 0 rows. "
+              "Key Brands SM / Non-MAP Brands SM may be paused or not serving "
+              "in this date window — investigate if this persists.")
+
+    # --- Query 2: Performance Max campaigns (no ad groups in the API) ---
+    pmax_query = f"""
+        SELECT
+            segments.date,
+            campaign.id,
+            campaign.name,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.conversions_value
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+          AND campaign.advertising_channel_type = PERFORMANCE_MAX
+    """
+
+    pmax_rows = []
+    stream = ga_service.search_stream(customer_id=CUSTOMER_ID, query=pmax_query)
+    for batch in stream:
+        for row in batch.results:
+            date_val = datetime.strptime(str(row.segments.date), "%Y-%m-%d").date()
+            campaign_id = str(row.campaign.id)
+            search_impression_share, search_lost_is_rank, search_lost_is_budget = (
+                share_lookup.get((date_val, campaign_id), (None, None, None))
+            )
+            pmax_rows.append((
+                date_val,
+                campaign_id,
+                row.campaign.name,
+                "PMAX",
+                "Performance Max",
+                int(row.metrics.impressions),
+                int(row.metrics.clicks),
+                float(row.metrics.cost_micros) / 1_000_000,
+                float(row.metrics.conversions),
+                float(row.metrics.conversions_value),
+                search_impression_share,
+                search_lost_is_rank,
+                search_lost_is_budget,
+            ))
+
+    rows = non_pmax_rows + pmax_rows
 
     if not rows:
         return 0
@@ -171,6 +226,24 @@ def _log_ingestion(db_conn, status: str, rows_written: int,
     db_conn.commit()
 
 
+def get_db_connection():
+    """
+    Return a psycopg2 connection from DATABASE_URL.
+    Password is treated literally — do NOT url-decode.
+    """
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL not set in .env")
+    parsed = urlparse(url)
+    return psycopg2.connect(
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        user=parsed.username,
+        password=parsed.password,
+        dbname=parsed.path.lstrip("/") or "postgres",
+    )
+
+
 def run(db_conn, lookback_days: int = 7):
     """Run Google Ads ingestion. Called by scheduler/weekly_job.py."""
     required_vars = [
@@ -206,3 +279,24 @@ def run(db_conn, lookback_days: int = 7):
         _log_ingestion(db_conn, "failed", rows, ingest_start, lookback_days, str(e))
         raise
     return rows
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Google Ads ingestion")
+    parser.add_argument(
+        "--backfill",
+        type=int,
+        metavar="DAYS",
+        default=7,
+        help="Number of days to look back (default: 7). Use 90 to catch up on missing history.",
+    )
+    args = parser.parse_args()
+
+    conn = get_db_connection()
+    try:
+        total = run(conn, lookback_days=args.backfill)
+        print(f"Done. {total} rows written for last {args.backfill} days.")
+    finally:
+        conn.close()
