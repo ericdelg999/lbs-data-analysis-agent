@@ -12,6 +12,9 @@ tmp/
 PROJECT_BRAIN.md
 specs/
 
+# Research, analysis, and internal strategy docs (never commit)
+research/
+
 # Python
 __pycache__/
 *.py[cod]
