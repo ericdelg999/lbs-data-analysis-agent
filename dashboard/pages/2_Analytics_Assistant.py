@@ -78,17 +78,27 @@ Return ONLY valid JSON (no markdown, no code fences, no explanation) with this e
 
 You can return multiple reports if the question requires comparing different time periods or different slices.
 
-Common GA4 dimensions: date, pagePath, sessionDefaultChannelGroup, sessionSource, sessionMedium, deviceCategory, country, city, itemId, itemName, itemBrand, itemCategory, landingPage, newVsReturning
-Common GA4 metrics: sessions, engagedSessions, bounceRate, averageSessionDuration, newUsers, totalUsers, screenPageViews, totalRevenue, itemsViewed, itemsAddedToCart, itemsCheckedOut, itemsPurchased, itemRevenue, ecommercePurchases, keyEvents, conversions
+Common GA4 dimensions:
+- session-scoped: date, pagePath, sessionDefaultChannelGroup, sessionSource, sessionMedium, deviceCategory, country, city, landingPage, newVsReturning
+- item-scoped: itemId, itemName, itemBrand, itemCategory
+- event-scoped: transactionId
+Common GA4 metrics:
+- session-scoped: sessions, engagedSessions, bounceRate, averageSessionDuration, newUsers, totalUsers, screenPageViews, totalRevenue, ecommercePurchases, transactions, keyEvents, conversions
+- item-scoped: itemRevenue, itemsViewed, itemsAddedToCart, itemsCheckedOut, itemsPurchased
 Date formats: "today", "yesterday", "NdaysAgo" (e.g., "30daysAgo", "90daysAgo"), or "YYYY-MM-DD"
+
+GA4 SCOPE COMPATIBILITY (critical — the API returns 400 if violated):
+- item-scoped dimensions are INCOMPATIBLE with session-scoped metrics. Never put `transactions`, `totalRevenue`, `sessions`, `ecommercePurchases`, or `keyEvents` in the same report as `itemId`/`itemName`/`itemBrand`/`itemCategory`.
+- For per-item analysis, use only item-scoped metrics with item-scoped dimensions.
+- `transactionId` (event-scoped) IS compatible with item-scoped metrics — use it when you need per-item transaction counts.
 
 Rules:
 - For funnel analysis, use item-scoped metrics: itemsViewed, itemsAddedToCart, itemsCheckedOut, itemsPurchased
-- For site-level metrics, use sessions, totalRevenue, ecommercePurchases
+- For site-level metrics (no item dimensions), use sessions, totalRevenue, ecommercePurchases, transactions
 - For time comparisons (this month vs last), use two report entries with different date ranges
 - Limit dimensions to 3 max per report
 - Always include the most relevant dimensions for the question
-- For ANY product revenue / top products / revenue movers / product trend question, the metrics list MUST include all three of: itemRevenue, transactions, itemsPurchased. These let downstream analysis distinguish "one large bulk order" (few transactions, many units) from "broad demand" (many transactions). Do not omit transactions or itemsPurchased for revenue-ranking questions even if the user only asked about revenue."""
+- For product revenue / top products / revenue movers / product trend questions: the report MUST include `transactionId` as a dimension alongside the item dimension (e.g., `itemName` + `transactionId`). Required metrics: `itemRevenue` and `itemsPurchased`. The result will have one row per (item, transactionId) pair, which downstream analysis aggregates to count distinct transactions per item — that is how it distinguishes "one large bulk order" (few transactions, many units) from "broad demand" (many transactions). DO NOT include `transactions` as a metric in any report containing item-scoped dimensions — it will cause a 400 error."""
 
 
 def clear_broken_proxy_env():
