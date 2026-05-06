@@ -14,6 +14,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PERIOD_WEEKS = int(os.getenv("ANALYSIS_PERIOD_WEEKS", "4"))
 
 
+def _escape_streamlit_markdown(text: str) -> str:
+    """Escape `$` so Streamlit's markdown engine doesn't interpret revenue
+    figures as LaTeX math delimiters. Without this, "$154 ... $400" renders
+    as a mangled formula with `**` becoming multiplication signs."""
+    return (text or "").replace("$", r"\$")
+
+
 def get_db_connection():
     """
     Return a psycopg2 connection using DATABASE_URL components as kwargs.
@@ -154,7 +161,7 @@ try:
                 f"{selected_report['week_ending'].strftime('%b %d, %Y')} — {selected_period_weeks}-week report"
             )
 
-        st.markdown(report["full_report_md"])
+        st.markdown(_escape_streamlit_markdown(report["full_report_md"]))
     else:
         st.error(
             f"Report not found for {selected_period_weeks}-week period ending "
