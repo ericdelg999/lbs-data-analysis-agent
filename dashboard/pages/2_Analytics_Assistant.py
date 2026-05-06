@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
+from google.analytics.data_v1beta.types import DateRange, Dimension, Filter, FilterExpression, Metric, RunReportRequest
 from google.oauth2 import service_account
 from openai import OpenAI
 
@@ -50,7 +50,7 @@ TEMPLATES = [
     },
     {
         "label": "High Traffic / Low Conversion",
-        "query": "Which product pages have the most traffic but the lowest add-to-cart rate? Last 30 days.",
+        "query": "Which products (by item name) have the most item views but the lowest add-to-cart rate over the last 30 days? Use item-scoped metrics — itemsViewed and itemsAddedToCart — not page metrics. Exclude items with fewer than 50 views.",
     },
     {
         "label": "Mobile vs Desktop Trend",
@@ -63,6 +63,7 @@ TEMPLATES = [
 ]
 
 GA4_DATE_PATTERN = re.compile(r"^(today|yesterday|\d+daysAgo|\d{4}-\d{2}-\d{2})$")
+ITEM_DIM_NAMES = ("itemId", "itemName", "itemBrand", "itemCategory")
 
 
 def _validate_ga4_date(value: str, fallback: str) -> str:
@@ -73,6 +74,97 @@ def _validate_ga4_date(value: str, fallback: str) -> str:
     """
     cleaned = (value or "").strip()
     return cleaned if GA4_DATE_PATTERN.match(cleaned) else fallback
+
+
+def _build_filter(filter_spec: dict | None) -> FilterExpression | None:
+    """Translate a translator-emitted filter dict into a GA4 FilterExpression.
+
+    Supports a single-dimension string filter (the common case for brand /
+    product-name lookups). Returns None if the spec is missing or malformed.
+    """
+    if not filter_spec or not isinstance(filter_spec, dict):
+        return None
+    dim = str(filter_spec.get("dimension", "")).strip()
+    val = str(filter_spec.get("value", "")).strip()
+    if not dim or not val:
+        return None
+    match_type_str = str(filter_spec.get("match_type", "CONTAINS")).strip().upper()
+    match_type = getattr(
+        Filter.StringFilter.MatchType,
+        match_type_str,
+        Filter.StringFilter.MatchType.CONTAINS,
+    )
+    return FilterExpression(
+        filter=Filter(
+            field_name=dim,
+            string_filter=Filter.StringFilter(
+                value=val,
+                match_type=match_type,
+                case_sensitive=bool(filter_spec.get("case_sensitive", False)),
+            ),
+        )
+    )
+
+
+def _aggregate_item_transaction_rows(spec: dict, rows: list[dict]) -> tuple[dict, list[dict]]:
+    """Collapse (item, transactionId) rows into per-item totals.
+
+    Why: when the translator includes `transactionId` alongside an item dimension
+    every row represents one item-in-one-order. The LLM cannot reliably aggregate
+    thousands of such rows in its head and tends to misread "1 row = 1 transaction
+    for this item" as "1 transaction TOTAL for this item." Doing the aggregation
+    in Python is deterministic and matches what the analyst prompt expects:
+    per-item revenue, units sold, and a count of distinct transactions.
+
+    No-op if the report doesn't have both transactionId and an item dimension.
+    """
+    dims = spec.get("dimensions", []) or []
+    if "transactionId" not in dims:
+        return spec, rows
+    item_dim = next((d for d in dims if d in ITEM_DIM_NAMES), None)
+    if item_dim is None:
+        return spec, rows
+
+    by_item: dict[str, dict] = {}
+    for row in rows:
+        key = row.get(item_dim, "(unknown)")
+        bucket = by_item.setdefault(
+            key,
+            {
+                item_dim: key,
+                "itemRevenue": 0.0,
+                "itemsPurchased": 0,
+                "_txn_ids": set(),
+            },
+        )
+        try:
+            bucket["itemRevenue"] += float(row.get("itemRevenue", "0") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            bucket["itemsPurchased"] += int(float(row.get("itemsPurchased", "0") or 0))
+        except (TypeError, ValueError):
+            pass
+        txn = row.get("transactionId")
+        if txn:
+            bucket["_txn_ids"].add(txn)
+
+    aggregated = []
+    for bucket in by_item.values():
+        aggregated.append(
+            {
+                item_dim: bucket[item_dim],
+                "itemRevenue": round(bucket["itemRevenue"], 2),
+                "itemsPurchased": bucket["itemsPurchased"],
+                "transactions": len(bucket["_txn_ids"]),
+            }
+        )
+    aggregated.sort(key=lambda r: r["itemRevenue"], reverse=True)
+
+    new_spec = dict(spec)
+    new_spec["dimensions"] = [item_dim]
+    new_spec["metrics"] = ["itemRevenue", "itemsPurchased", "transactions"]
+    return new_spec, aggregated
 
 
 def _build_translate_prompt(today: str) -> str:
@@ -90,10 +182,18 @@ Return ONLY valid JSON (no markdown, no code fences, no explanation) with this e
       "dimensions": ["dimension1", "dimension2"],
       "metrics": ["metric1", "metric2"],
       "start_date": "30daysAgo",
-      "end_date": "today"
+      "end_date": "today",
+      "filter": {{
+        "dimension": "itemBrand",
+        "match_type": "CONTAINS",
+        "value": "Keystone",
+        "case_sensitive": false
+      }}
     }}
   ]
 }}
+
+The `filter` field is OPTIONAL. Include it ONLY when the user names a specific brand, product, page path, channel, or other concrete value to narrow the report. Without a filter, the report returns the whole catalog/site (and may be capped by row limits).
 
 You can return multiple reports if the question requires comparing different time periods or different slices.
 
@@ -126,7 +226,15 @@ Rules:
 - For time comparisons (this month vs last), use two report entries with different date ranges
 - Limit dimensions to 3 max per report
 - Always include the most relevant dimensions for the question
-- For product revenue / top products / revenue movers / product trend questions: the report MUST include `transactionId` as a dimension alongside the item dimension (e.g., `itemName` + `transactionId`). Required metrics: `itemRevenue` and `itemsPurchased`. The result will have one row per (item, transactionId) pair, which downstream analysis aggregates to count distinct transactions per item — that is how it distinguishes "one large bulk order" (few transactions, many units) from "broad demand" (many transactions). DO NOT include `transactions` as a metric in any report containing item-scoped dimensions — it will cause a 400 error."""
+- For "product page" / "high traffic / low ATC" / per-product engagement questions, use the item dimension `itemName` (or `itemId`) — NOT `pagePath`. `pagePath` includes category, blog, and search pages that don't have add-to-cart and will pollute the result. Item metrics: `itemsViewed`, `itemsAddedToCart`, `itemsCheckedOut`, `itemsPurchased`.
+- For product revenue / top products / revenue movers / product trend / brand performance questions: the report MUST include `transactionId` as a dimension alongside the item dimension (e.g., `itemName` + `transactionId`). Required metrics: `itemRevenue` and `itemsPurchased`. The result is one row per (item, transactionId) pair; downstream code aggregates per item and counts distinct transactions to distinguish "one large bulk order" (few transactions, many units) from "broad demand" (many transactions). DO NOT include `transactions` as a metric in any report containing item-scoped dimensions — it will cause a 400 error.
+- DIMENSION FILTERS (use them when the user names a specific subject):
+  - "How is Keystone doing?" / "Keystone sales last 90 days" → filter `{{"dimension": "itemBrand", "match_type": "CONTAINS", "value": "Keystone", "case_sensitive": false}}`
+  - "Sales of GE bulbs" → filter on `itemBrand` CONTAINS "GE" (or `itemName` if you're not sure the brand dimension is populated for that vendor)
+  - "Performance of /led-bulbs/ category page" → filter on `pagePath` CONTAINS "/led-bulbs/"
+  - "Direct traffic conversion rate" → filter on `sessionDefaultChannelGroup` EXACT "Direct"
+  Without a filter, brand/product-specific questions get diluted by the whole catalog. ALWAYS add a filter when the user names a brand, vendor, or product term.
+- Match types: "CONTAINS" (case-insensitive partial match — safe default), "EXACT" (full equality), "BEGINS_WITH" (prefix match)."""
 
 
 def clear_broken_proxy_env():
@@ -226,12 +334,15 @@ def translate_question(client: OpenAI, question: str) -> list[dict]:
         if not metrics:
             continue
 
+        filter_spec = report.get("filter") if isinstance(report.get("filter"), dict) else None
+
         normalized_reports.append(
             {
                 "dimensions": dimensions,
                 "metrics": metrics,
                 "start_date": start_date,
                 "end_date": end_date,
+                "filter": filter_spec,
             }
         )
 
@@ -247,6 +358,7 @@ def run_ga4_report(
     metrics: list[str],
     start_date: str,
     end_date: str,
+    filter_spec: dict | None = None,
 ) -> list[dict]:
     """
     Run a GA4 report and return rows as a list of dicts.
@@ -254,14 +366,21 @@ def run_ga4_report(
     """
     property_id = os.getenv("GA4_PROPERTY_ID")
     active_metrics = list(metrics)
+    dim_filter = _build_filter(filter_spec)
 
-    request = RunReportRequest(
-        property=f"properties/{property_id}",
-        dimensions=[Dimension(name=dimension) for dimension in dimensions],
-        metrics=[Metric(name=metric) for metric in active_metrics],
-        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-        limit=10_000,
-    )
+    def _build_request(metrics_list):
+        kwargs = dict(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name=dimension) for dimension in dimensions],
+            metrics=[Metric(name=metric) for metric in metrics_list],
+            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+            limit=10_000,
+        )
+        if dim_filter is not None:
+            kwargs["dimension_filter"] = dim_filter
+        return RunReportRequest(**kwargs)
+
+    request = _build_request(active_metrics)
 
     try:
         response = client.run_report(request)
@@ -269,14 +388,7 @@ def run_ga4_report(
         if "keyEvents" not in str(exc) or "keyEvents" not in active_metrics:
             raise
         active_metrics = ["conversions" if metric == "keyEvents" else metric for metric in active_metrics]
-        request = RunReportRequest(
-            property=f"properties/{property_id}",
-            dimensions=[Dimension(name=dimension) for dimension in dimensions],
-            metrics=[Metric(name=metric) for metric in active_metrics],
-            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-            limit=10_000,
-        )
-        response = client.run_report(request)
+        response = client.run_report(_build_request(active_metrics))
 
     rows = []
     dim_headers = [header.name for header in response.dimension_headers]
@@ -329,16 +441,19 @@ def run_ga4_query(question: str) -> tuple[str, list[dict]]:
             metrics=spec["metrics"],
             start_date=spec["start_date"],
             end_date=spec["end_date"],
+            filter_spec=spec.get("filter"),
         )
-        total_rows += len(rows)
+        effective_spec, effective_rows = _aggregate_item_transaction_rows(spec, rows)
+        total_rows += len(effective_rows)
         all_results.append(
             {
                 "report_index": index,
-                "dimensions": spec["dimensions"],
-                "metrics": spec["metrics"],
-                "date_range": f"{spec['start_date']} to {spec['end_date']}",
-                "row_count": len(rows),
-                "rows": rows[:200],
+                "dimensions": effective_spec["dimensions"],
+                "metrics": effective_spec["metrics"],
+                "date_range": f"{effective_spec['start_date']} to {effective_spec['end_date']}",
+                "filter": effective_spec.get("filter"),
+                "row_count": len(effective_rows),
+                "rows": effective_rows[:200],
             }
         )
 
