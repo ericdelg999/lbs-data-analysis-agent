@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -60,21 +62,38 @@ TEMPLATES = [
     },
 ]
 
-TRANSLATE_SYSTEM_PROMPT = """You are a Google Analytics 4 Data API expert. Translate the user's natural language question into GA4 Data API report parameters.
+GA4_DATE_PATTERN = re.compile(r"^(today|yesterday|\d+daysAgo|\d{4}-\d{2}-\d{2})$")
 
-The GA4 property is for lightbulbsurplus.com, an ecommerce site.
+
+def _validate_ga4_date(value: str, fallback: str) -> str:
+    """Substitute a safe default if the LLM emits a phrase the GA4 API can't parse.
+
+    GA4 Data API accepts ONLY: today, yesterday, NdaysAgo, or YYYY-MM-DD.
+    Natural-language phrases like "first day of this month" return a 400.
+    """
+    cleaned = (value or "").strip()
+    return cleaned if GA4_DATE_PATTERN.match(cleaned) else fallback
+
+
+def _build_translate_prompt(today: str) -> str:
+    """System prompt for the question→GA4-params translator. Today's date is
+    injected so the model can convert relative phrases like "this month" into
+    concrete YYYY-MM-DD ranges."""
+    return f"""You are a Google Analytics 4 Data API expert. Translate the user's natural language question into GA4 Data API report parameters.
+
+The GA4 property is for lightbulbsurplus.com, an ecommerce site. Today's date is {today}.
 
 Return ONLY valid JSON (no markdown, no code fences, no explanation) with this exact structure:
-{
+{{
   "reports": [
-    {
+    {{
       "dimensions": ["dimension1", "dimension2"],
       "metrics": ["metric1", "metric2"],
       "start_date": "30daysAgo",
       "end_date": "today"
-    }
+    }}
   ]
-}
+}}
 
 You can return multiple reports if the question requires comparing different time periods or different slices.
 
@@ -85,7 +104,16 @@ Common GA4 dimensions:
 Common GA4 metrics:
 - session-scoped: sessions, engagedSessions, bounceRate, averageSessionDuration, newUsers, totalUsers, screenPageViews, totalRevenue, ecommercePurchases, transactions, keyEvents, conversions
 - item-scoped: itemRevenue, itemsViewed, itemsAddedToCart, itemsCheckedOut, itemsPurchased
-Date formats: "today", "yesterday", "NdaysAgo" (e.g., "30daysAgo", "90daysAgo"), or "YYYY-MM-DD"
+
+GA4 API DATE FORMAT (strict — anything else returns a 400 error):
+- "today", "yesterday"
+- "NdaysAgo" (e.g., "7daysAgo", "30daysAgo", "90daysAgo")
+- "YYYY-MM-DD" (e.g., "{today}")
+NEVER output natural-language phrases like "first day of this month", "start of last quarter", or "beginning of the year". Convert them using today = {today}:
+- "this month" / "this month so far" → start_date: first of current month in YYYY-MM-DD, end_date: "today"
+- "last month" → start_date: first of prior month YYYY-MM-DD, end_date: last day of prior month YYYY-MM-DD
+- "this year" → start_date: "YYYY-01-01" of current year, end_date: "today"
+- "last 30 days" → start_date: "30daysAgo", end_date: "today"
 
 GA4 SCOPE COMPATIBILITY (critical — the API returns 400 if violated):
 - item-scoped dimensions are INCOMPATIBLE with session-scoped metrics. Never put `transactions`, `totalRevenue`, `sessions`, `ecommercePurchases`, or `keyEvents` in the same report as `itemId`/`itemName`/`itemBrand`/`itemCategory`.
@@ -176,10 +204,11 @@ def _extract_response_text(resp) -> str:
 
 def translate_question(client: OpenAI, question: str) -> list[dict]:
     """Ask OpenAI to translate a natural language question into GA4 API params."""
+    today = datetime.now().strftime("%Y-%m-%d")
     response = client.responses.create(
         model=GA4_MODEL,
         input=[
-            {"role": "system", "content": [{"type": "input_text", "text": TRANSLATE_SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "input_text", "text": _build_translate_prompt(today)}]},
             {"role": "user", "content": [{"type": "input_text", "text": question}]},
         ],
     )
@@ -191,8 +220,8 @@ def translate_question(client: OpenAI, question: str) -> list[dict]:
     for report in reports:
         dimensions = _normalize_dimensions(report.get("dimensions", []))
         metrics = _normalize_metrics(report.get("metrics", []))
-        start_date = str(report.get("start_date", "30daysAgo")).strip()
-        end_date = str(report.get("end_date", "today")).strip()
+        start_date = _validate_ga4_date(str(report.get("start_date", "")), "30daysAgo")
+        end_date = _validate_ga4_date(str(report.get("end_date", "")), "today")
 
         if not metrics:
             continue
