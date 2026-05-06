@@ -66,6 +66,13 @@ GA4_DATE_PATTERN = re.compile(r"^(today|yesterday|\d+daysAgo|\d{4}-\d{2}-\d{2})$
 ITEM_DIM_NAMES = ("itemId", "itemName", "itemBrand", "itemCategory")
 
 
+def _escape_streamlit_markdown(text: str) -> str:
+    """Escape `$` so Streamlit's markdown engine doesn't interpret revenue
+    figures as LaTeX math delimiters. Without this, "$154 AOV ... $150-$400"
+    renders as a mangled math expression."""
+    return (text or "").replace("$", r"\$")
+
+
 def _validate_ga4_date(value: str, fallback: str) -> str:
     """Substitute a safe default if the LLM emits a phrase the GA4 API can't parse.
 
@@ -223,7 +230,11 @@ GA4 SCOPE COMPATIBILITY (critical — the API returns 400 if violated):
 Rules:
 - For funnel analysis, use item-scoped metrics: itemsViewed, itemsAddedToCart, itemsCheckedOut, itemsPurchased
 - For site-level metrics (no item dimensions), use sessions, totalRevenue, ecommercePurchases, transactions
-- For time comparisons (this month vs last), use two report entries with different date ranges
+- TREND / COMPARISON DETECTION (critical): if the question contains ANY of these signals — "plummeted", "declined", "dropped", "fell", "fallen", "down", "up", "grown", "growing", "increasing", "decreasing", "trending", "vs last", "compared to", "year over year", "YoY", "month over month", "MoM" — you MUST return TWO reports with identical dimensions, metrics, and filter, but different date ranges. Without two reports the answer cannot prove the trend.
+  - "Has Keystone plummeted in the last 90 days?" → Report 1: 90daysAgo→today; Report 2: 180daysAgo→91daysAgo
+  - "Is mobile traffic growing?" → Report 1: 30daysAgo→today; Report 2: 60daysAgo→31daysAgo
+  - "Revenue this month vs last month" → Report 1: first of current month→today; Report 2: prior month full range (YYYY-MM-01→YYYY-MM-DD last day)
+  - "Sales YoY for last 30 days" → Report 1: 30daysAgo→today; Report 2: same dates one year prior in YYYY-MM-DD form
 - Limit dimensions to 3 max per report
 - Always include the most relevant dimensions for the question
 - For "product page" / "high traffic / low ATC" / per-product engagement questions, use the item dimension `itemName` (or `itemId`) — NOT `pagePath`. `pagePath` includes category, blog, and search pages that don't have add-to-cart and will pollute the result. Item metrics: `itemsViewed`, `itemsAddedToCart`, `itemsCheckedOut`, `itemsPurchased`.
@@ -580,7 +591,7 @@ elif run_clicked and query.strip():
                 {"question": query.strip(), "result": result_text, "reports": raw_results}
             ] + st.session_state["ga4_query_history"][:4]
             st.divider()
-            st.markdown(result_text)
+            st.markdown(_escape_streamlit_markdown(result_text))
             render_raw_query_details(raw_results)
         except json.JSONDecodeError:
             st.error("AI returned invalid query parameters. Try rephrasing your question.")
@@ -601,5 +612,5 @@ if st.session_state["ga4_query_history"]:
     with st.expander("Recent Queries", expanded=False):
         for item in st.session_state["ga4_query_history"]:
             st.markdown(f"**{item['question']}**")
-            st.markdown(item["result"])
+            st.markdown(_escape_streamlit_markdown(item["result"]))
             render_raw_query_details(item.get("reports", []))
